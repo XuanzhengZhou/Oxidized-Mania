@@ -1,0 +1,19 @@
+{
+  "scroll_speed": 26.000000000000004,
+  "global_offset": -105.0,
+  "key_bindings": [
+    "z",
+    "x",
+    "2",
+    "3"
+  ],
+  "song_rate": 0.9999999999999992,
+  "show_fps": true,
+  "fullscreen": false,
+  "stage_spacing": 95.0,
+  "stage_scale": 1.2,
+  "hit_position": 553.0,
+  "active_skin": "R Skin v2.2 (New style_Diamond) (Retsukiya)",
+  "od": 8.0,
+  "mirror_mode": false
+}

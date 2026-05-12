@@ -1,0 +1,29 @@
+[package]
+name = "oxidized_mania"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winit = "0.30"
+wgpu = "24"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytemuck = { version = "1", features = ["derive"] }
+fontdue = "0.9"
+image = "0.25"
+log = "0.4"
+env_logger = "0.11"
+pollster = "0.4"
+flate2 = "1"
+rosu-pp = "4"
+rhythm-open-exchange = { git = "https://github.com/XuanzhengZhou/Rhythm-Open-Exchange.git", branch = "feat/malody-codec", features = ["analysis", "compression"] }
+dhat = "0.3"
+
+[features]
+dhat-heap = []
+
+[profile.release]
+debug = 1
+
+[build-dependencies]
+cc = "1"
