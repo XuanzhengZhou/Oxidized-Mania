@@ -13,4 +13,5 @@ libsonic.so
 referance/
 target/
 .DS_Store
+.claude/
 CLAUDE.md
