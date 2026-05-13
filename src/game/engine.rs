@@ -510,6 +510,7 @@ impl GameEngine {
                         acc, self.score.good_count, self.score.ok_count,
                         self.score.meh_count, self.score.miss_count).to_string();
                     let pp_val = crate::pp::calculate_pp(&self.map_path, self.song_rate, acc, self.score.miss_count, self.max_combo);
+                    let diff_label = crate::difficulty::analyze_path_label(&self.map_path, self.song_rate, self.config.od);
                     self.exit_result = Some(GameResult {
                         score: self.score.total_score,
                         standardized_score: standard,
@@ -532,6 +533,7 @@ impl GameEngine {
                         stars: self.stars,
                         pp: pp_val,
                         cover_path: self.cover_path.clone(),
+                        difficulty_label: diff_label,
                     });
                     let _ = self.audio.stop();
                     let offsets = self.replay_data.as_ref()

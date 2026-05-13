@@ -19,6 +19,9 @@ pub struct DiffMeta {
     pub tap_count: usize,
     pub hold_count: usize,
     pub cover_path: Option<String>,
+    pub rc_label: String,
+    pub dim_speed: f64, pub dim_stamina: f64,
+    pub dim_chord: f64, pub dim_tech: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -93,7 +96,12 @@ pub fn build_folder_meta(songs: &[crate::menu::SongEntry], config: &GameConfig) 
                 let holds = total - taps;
                 let dur = notes.iter().map(|n| n.end_time.max(n.time)).fold(0.0, f64::max);
                 let stars = crate::pp::calculate_stars(j, config.song_rate);
-                diffs.push(DiffMeta { name, stars, notes_count: total, duration: dur, bpm, mapper, tap_count: taps, hold_count: holds, cover_path });
+                let (rc_label, dim_speed, dim_stamina, dim_chord, dim_tech) =
+                    match crate::difficulty::analyze_difficulty(&notes, config.song_rate, config.od) {
+                        Ok(d) => (d.fuzzy_label(), d.dimensions.speed, d.dimensions.stamina, d.dimensions.chord, d.dimensions.tech),
+                        Err(_) => (String::new(), 0.0, 0.0, 0.0, 0.0),
+                    };
+                diffs.push(DiffMeta { name, stars, notes_count: total, duration: dur, bpm, mapper, tap_count: taps, hold_count: holds, cover_path, rc_label, dim_speed, dim_stamina, dim_chord, dim_tech });
             }
         }
         // 按星数升序排列难度
@@ -174,6 +182,27 @@ pub fn render(quad: &mut QuadRenderer, text: &mut TextRenderer, state: &SongSele
     if !diff.mapper.is_empty() {
         text.queue_text("by ", 105.0, 122.0, 11.0, sc);
         text.queue_text(&diff.mapper, 125.0, 122.0, 11.0, theme::MAPPER_TEXT);
+    }
+
+    // RC 难度标签（星数胶囊下方 3 行）
+    if !diff.rc_label.is_empty() {
+        text.queue_text(&diff.rc_label, 20.0, 170.0, 10.0, GRAY_160);
+    }
+    // 四维技能条（"单点"上一行，全称，宽度×1.8）
+    let sy = panel_h - 55.0;
+    let skill_y = (sy - 24.0) as f32;
+    let skill_x0 = 20.0f32;
+    let skill_w = 86.0f32;
+    let skill_gap = 4.0f32;
+    let dims: [(&str, f64); 4] = [("Speed", diff.dim_speed), ("Stamina", diff.dim_stamina), ("Chord", diff.dim_chord), ("Tech", diff.dim_tech)];
+    for (i, (label, val)) in dims.iter().enumerate() {
+        let sx = skill_x0 + i as f32 * (skill_w + skill_gap);
+        let pct = (*val as f32 / 45.0).clamp(0.0, 1.0);
+        let bar_h = pct * 12.0;
+        let c = theme::star_color(*val * 0.25);
+        quad.push_rect(sx, skill_y + 12.0 - bar_h, skill_w, bar_h, c);
+        quad.push_rect(sx, skill_y + 12.0, skill_w, 1.0, [80, 80, 90, 120]);
+        text.queue_text(label, sx + 2.0, skill_y - 2.0, 8.0, GRAY_160);
     }
 
     let sy = panel_h - 55.0;

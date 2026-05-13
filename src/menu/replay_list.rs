@@ -10,6 +10,8 @@ pub struct ReplayListState {
     pub entries: Vec<(String, ReplayData)>,
     pub selected: usize,
     pub config: GameConfig,
+    pub folder_idx: usize,
+    pub diff_idx: usize,
 }
 
 pub fn render(state: &ReplayListState, quad: &mut QuadRenderer, text: &mut TextRenderer) {

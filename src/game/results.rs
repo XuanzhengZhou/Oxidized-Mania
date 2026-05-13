@@ -32,6 +32,7 @@ pub struct GameResult {
     pub stars: f64,
     pub pp: f64,
     pub cover_path: Option<String>,
+    pub difficulty_label: String,
 }
 
 // ─── 辅助函数 ───
@@ -235,20 +236,39 @@ fn draw_page1(
     let score_w = score_str.len() as f32 * 24.0 * 0.55;
     text.queue_text(&score_str, cx - score_w / 2.0, 210.0 + shift_y + text_down, 22.0, [206, 228, 251, 255]);
 
-    // 星数胶囊 + mods
-    let star_text = format!("{:.2}★", result.stars);
-    let star_tw = star_text.len() as f32 * 11.0 * 0.55;
-    let star_cap_x = cx - star_tw / 2.0 - 6.0;
-    let star_cap_y = 242.0 + shift_y + text_down;
-    // 星数胶囊（真圆角）
-    let sc = theme::star_color(result.stars);
-    draw_pill_at(quad, star_cap_x, star_cap_y, star_tw + 12.0, 16.0, sc);
-    text.queue_text(&star_text, star_cap_x + 6.0, star_cap_y + 1.0, 11.0, [0, 0, 0, 255]);
-
-    let mut mods_str = format!("OD:{:.1}", result.od);
-    if (result.song_rate - 1.0).abs() > 0.01 { mods_str.push_str(&format!(" {:.1}x", result.song_rate)); }
-    if result.mirror_mode { mods_str.push_str(" Mirror"); }
-    text.queue_text(&mods_str, star_cap_x + star_tw + 20.0, star_cap_y + 2.0, 10.0, [180, 180, 200, 255]);
+    // 难度标签（星数胶囊左侧，向左偏移 4/2 个 about 宽度）
+    if !result.difficulty_label.is_empty() {
+        let dl_w = result.difficulty_label.len() as f32 * 7.0 * 0.55;
+        let about_w = 5.0 * 7.0 * 0.55;  // "about" ≈ 19px
+        let star_text = format!("{:.2}★", result.stars);
+        let star_tw = star_text.len() as f32 * 11.0 * 0.55;
+        let total_w = dl_w + star_tw + 30.0;
+        let cap_x = cx - total_w / 2.0 - about_w * 4.0;  // 标签左移 4×about
+        let cap_y = 242.0 + shift_y + text_down;
+        text.queue_text(&result.difficulty_label, cap_x, cap_y + 1.0, 10.0, [180, 180, 200, 255]);
+        // 星数胶囊（左移 2×about）
+        let sc = theme::star_color(result.stars);
+        let star_x = cap_x + dl_w + 12.0 + about_w * 2.0;
+        draw_pill_at(quad, star_x, cap_y, star_tw + 12.0, 16.0, sc);
+        text.queue_text(&star_text, star_x + 6.0, cap_y + 1.0, 11.0, [0, 0, 0, 255]);
+        let mut mods_str = format!("OD:{:.1}", result.od);
+        if (result.song_rate - 1.0).abs() > 0.01 { mods_str.push_str(&format!(" {:.1}x", result.song_rate)); }
+        if result.mirror_mode { mods_str.push_str(" Mirror"); }
+        text.queue_text(&mods_str, star_x + star_tw + 20.0, cap_y + 2.0, 10.0, [180, 180, 200, 255]);
+    } else {
+        // 无难度标签时保持原有布局
+        let star_text = format!("{:.2}★", result.stars);
+        let star_tw = star_text.len() as f32 * 11.0 * 0.55;
+        let star_cap_x = cx - star_tw / 2.0 - 6.0;
+        let star_cap_y = 242.0 + shift_y + text_down;
+        let sc = theme::star_color(result.stars);
+        draw_pill_at(quad, star_cap_x, star_cap_y, star_tw + 12.0, 16.0, sc);
+        text.queue_text(&star_text, star_cap_x + 6.0, star_cap_y + 1.0, 11.0, [0, 0, 0, 255]);
+        let mut mods_str = format!("OD:{:.1}", result.od);
+        if (result.song_rate - 1.0).abs() > 0.01 { mods_str.push_str(&format!(" {:.1}x", result.song_rate)); }
+        if result.mirror_mode { mods_str.push_str(" Mirror"); }
+        text.queue_text(&mods_str, star_cap_x + star_tw + 20.0, star_cap_y + 2.0, 10.0, [180, 180, 200, 255]);
+    }
 
     // 准确率 / 最大连击 / PP (3列)
     let col_w = left_w / 3.0;

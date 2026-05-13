@@ -9,8 +9,9 @@ use winit::window::{Window, WindowAttributes};
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-mod app; mod audio; mod beatmap; mod beatmap_cache; mod config; mod game; mod history;
-mod menu; mod pp; mod render; mod replay; mod replay_viewer; mod skin; mod sonic; mod ui;
+mod app; mod audio; mod beatmap; mod beatmap_cache; mod config; mod difficulty; mod game;
+mod history; mod menu; mod pp; mod render; mod replay; mod replay_viewer; mod skin;
+mod sonic; mod ui;
 
 // ─── 鼠标输入状态 ───
 
@@ -85,7 +86,7 @@ enum AppState {
     Preview { song: SongEntry, diff: usize, name: String, dur: String, notes: usize, stars: f64, config: GameConfig },
     Gameplay { engine: GameEngine, replay_data: Option<crate::replay::ReplayData>, config: GameConfig },
     ReplayList { state: menu::replay_list::ReplayListState },
-    ReplayPlayback { engine: crate::replay_viewer::ReplayEngine, replay: crate::replay::ReplayData, config: GameConfig },
+    ReplayPlayback { engine: crate::replay_viewer::ReplayEngine, replay: crate::replay::ReplayData, config: GameConfig, folder_idx: usize, diff_idx: usize },
     Results {
         result: GameResult,
         replay: Option<crate::replay::ReplayData>,
@@ -282,6 +283,7 @@ impl App {
                     song_name: r.map_path.clone(), map_path: r.map_path.clone(),
                     song_rate: r.song_rate, od: r.od, mirror_mode: r.mirror_mode,
                     rank, stars: stars_val, pp: pp_val, cover_path,
+                    difficulty_label: crate::difficulty::analyze_path_label(&r.map_path, r.song_rate, r.od),
                 };
                 self.render = None;
                 let offsets = crate::game::results::compute_hit_offsets(&r, &r.map_path);
@@ -624,14 +626,19 @@ impl App {
                     let entries: Vec<_> = crate::replay::list_replays(&map_path).into_iter()
                         .filter_map(|p| crate::replay::ReplayData::load(&p).ok().map(|d| (p, d)))
                         .collect();
-                    next = Some(AppState::ReplayList { state: menu::replay_list::ReplayListState { map_path, entries, selected: 0, config: config.clone() } });
+                    next = Some(AppState::ReplayList { state: menu::replay_list::ReplayListState { map_path, entries, selected: 0, config: config.clone(), folder_idx: state.folder_idx, diff_idx: state.diff_idx } });
                 }
                 _ => {}
             }
             AppState::ReplayList { ref mut state } => match key {
                 KeyCode::Escape | KeyCode::KeyR => {
                     let cfg = state.config.clone();
-                    let new_state = SongSelectState::new(self.folders_cache.clone(), cfg.clone());
+                    let mut new_state = SongSelectState::new(self.folders_cache.clone(), cfg.clone());
+                    new_state.folder_idx = state.folder_idx;
+                    new_state.diff_idx = state.diff_idx;
+                    let st = new_state.scroll_to_current_diff();
+                    new_state.scroll_y = st;
+                    new_state.target_scroll_y = st;
                     self.render = None;
                     next = Some(AppState::SongSelect { state: new_state, config: cfg });
                 }
@@ -664,7 +671,7 @@ impl App {
                         ) {
                             Ok(engine) => {
                                 self.render = None;
-                                next = Some(AppState::ReplayPlayback { engine, replay: rdata.clone(), config });
+                                next = Some(AppState::ReplayPlayback { engine, replay: rdata.clone(), config, folder_idx: state.folder_idx, diff_idx: state.diff_idx });
                             }
                             Err(e) => log::error!("ReplayEngine: {e}"),
                         }
@@ -672,7 +679,7 @@ impl App {
                 }
                 _ => {}
             }
-            AppState::ReplayPlayback { engine, replay, config } => {
+            AppState::ReplayPlayback { engine, replay, config, folder_idx, diff_idx } => {
                 if engine.finished && key == KeyCode::Enter {
                     let r = replay;
                     let acc = r.acc;
@@ -696,6 +703,7 @@ impl App {
                         song_name: r.map_path.clone(), map_path: r.map_path.clone(),
                         song_rate: r.song_rate, od: r.od, mirror_mode: r.mirror_mode,
                         rank, stars: stars_val, pp: pp_val, cover_path,
+                        difficulty_label: crate::difficulty::analyze_path_label(&r.map_path, r.song_rate, r.od),
                     };
                     let offsets = crate::game::results::compute_hit_offsets(&r, &result.map_path);
                     self.render = None;
@@ -707,7 +715,14 @@ impl App {
                 } else if !engine.finished {
                     match key {
                         KeyCode::Escape => {
-                            let state = SongSelectState::new(self.folders_cache.clone(), config.clone());
+                            let fi = *folder_idx;
+                            let di = *diff_idx;
+                            let mut state = SongSelectState::new(self.folders_cache.clone(), config.clone());
+                            state.folder_idx = fi;
+                            state.diff_idx = di;
+                            let st = state.scroll_to_current_diff();
+                            state.scroll_y = st;
+                            state.target_scroll_y = st;
                             self.render = None;
                             next = Some(AppState::SongSelect { state, config: config.clone() });
                         }
@@ -725,8 +740,10 @@ impl App {
                     match key {
                         KeyCode::Escape => { *adjuster = None; config.save("config.json"); }
                         KeyCode::Enter => { (adj.setter)(config, adj.value); *adjuster = None; config.save("config.json"); }
-                        KeyCode::ArrowLeft | KeyCode::ArrowDown => adj.value = (adj.value - adj.step).max(adj.min),
-                        KeyCode::ArrowRight | KeyCode::ArrowUp => adj.value = (adj.value + adj.step).min(adj.max),
+                        KeyCode::ArrowLeft => adj.value = (adj.value - adj.step).max(adj.min),
+                        KeyCode::ArrowRight => adj.value = (adj.value + adj.step).min(adj.max),
+                        KeyCode::ArrowDown => adj.value = (adj.value - 1.0).max(adj.min),
+                        KeyCode::ArrowUp => adj.value = (adj.value + 1.0).min(adj.max),
                         _ => {}
                     }
                     return;
@@ -750,7 +767,7 @@ impl App {
                     KeyCode::Digit2 => *binding_idx = Some(1),
                     KeyCode::Digit3 => *binding_idx = Some(2),
                     KeyCode::Digit4 => *binding_idx = Some(3),
-                    _ => { settings_shortcut(config, key); config.save("config.json"); }
+                    _ => { settings_shortcut(config, key, self.shift_held); config.save("config.json"); }
                 }
             }
             AppState::Preview { song, diff, stars, config, .. } => match key {
@@ -891,6 +908,8 @@ fn settings_secondary_count(primary: usize) -> usize {
 fn settings_activate(primary: &mut usize, secondary: &mut usize, binding_idx: &mut Option<usize>, adjuster: &mut Option<Adjuster>, config: &mut GameConfig) {
     match *primary {
         0 => match *secondary {
+            0 => { let v = config.scroll_speed; *adjuster = Some(Adjuster { label: "流速", value: v, min: 5.0, max: 60.0, step: 0.1, setter: |c, val| c.scroll_speed = val }); }
+            1 => { let v = config.od; *adjuster = Some(Adjuster { label: "OD 判定精度", value: v, min: 0.0, max: 11.0, step: 0.1, setter: |c, val| c.od = val }); }
             2 => { let v = config.hit_position; *adjuster = Some(Adjuster { label: "判定线位置", value: v, min: 300.0, max: 580.0, step: 5.0, setter: |c, val| c.hit_position = val }); }
             5 => config.mirror_mode = !config.mirror_mode,
             _ => {}
@@ -906,12 +925,14 @@ fn settings_activate(primary: &mut usize, secondary: &mut usize, binding_idx: &m
     config.save("config.json");
 }
 
-fn settings_shortcut(config: &mut GameConfig, key: KeyCode) {
+fn settings_shortcut(config: &mut GameConfig, key: KeyCode, shift: bool) {
+    let spd_step: f64 = if shift { 1.0 } else { 0.1 };
+    let od_step: f64 = if shift { 1.0 } else { 0.1 };
     match key {
-        KeyCode::KeyL => config.scroll_speed = (config.scroll_speed - 1.0).max(5.0),
-        KeyCode::KeyJ => config.scroll_speed += 1.0,
-        KeyCode::KeyO => config.od = (config.od - 0.5).max(0.0),
-        KeyCode::KeyP => config.od = (config.od + 0.5).min(11.0),
+        KeyCode::KeyL => config.scroll_speed = (config.scroll_speed - spd_step).max(5.0),
+        KeyCode::KeyJ => config.scroll_speed = (config.scroll_speed + spd_step).min(60.0),
+        KeyCode::KeyO => config.od = (config.od - od_step).max(0.0),
+        KeyCode::KeyP => config.od = (config.od + od_step).min(11.0),
         KeyCode::KeyU => config.hit_position = (config.hit_position - 10.0).max(300.0),
         KeyCode::KeyI => config.hit_position = (config.hit_position + 10.0).min(580.0),
         KeyCode::KeyK => config.stage_spacing = (config.stage_spacing - 5.0).max(50.0),
