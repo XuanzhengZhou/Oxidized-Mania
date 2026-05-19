@@ -9,9 +9,47 @@ use winit::window::{Window, WindowAttributes};
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-mod app; mod audio; mod beatmap; mod beatmap_cache; mod config; mod difficulty; mod game;
-mod history; mod menu; mod pp; mod render; mod replay; mod replay_viewer; mod skin;
-mod sonic; mod ui;
+mod app; mod audio; mod beatmap; mod beatmap_cache; mod config; mod difficulty; mod editor;
+mod game; mod history; mod menu; mod pp; mod render; mod replay; mod replay_viewer;
+mod skin; mod sonic; mod ui;
+
+/// 倍速改变时刷新当前文件夹所有难度的星数和难度标签
+fn refresh_diffs_for_rate(state: &mut SongSelectState, config: &GameConfig) {
+    let folder_idx = state.folder_idx;
+    if let Some(folder) = state.folders.get_mut(folder_idx) {
+        for (di, json) in folder.jsons.iter().enumerate() {
+            if let Some(diff) = folder.diffs.get_mut(di) {
+                diff.stars = crate::pp::calculate_stars(json, config.song_rate);
+                if let Ok((_, notes)) = load_beatmap_rox(json) {
+                    if let Ok(d) = crate::difficulty::analyze_difficulty(&notes, config.song_rate, config.od) {
+                        diff.rc_label = d.fuzzy_label();
+                        diff.dim_speed = d.dimensions.speed;
+                        diff.dim_stamina = d.dimensions.stamina;
+                        diff.dim_chord = d.dimensions.chord;
+                        diff.dim_tech = d.dimensions.tech;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 加载音频：优先 BASS_FX 实时变速，失败回退 sonic WAV
+fn load_audio_with_rate(audio: &mut BassAudio, sname: &str, parent_dir: &std::path::Path, rate: f32) -> String {
+    match audio.load_with_tempo(sname, rate) {
+        Ok(false) => sname.to_string(),
+        Ok(true) | Err(_) => {
+            let stem = std::path::Path::new(sname).file_stem().unwrap().to_string_lossy();
+            let t = format!(".temp_{}x_{}", rate, stem);
+            let tp = parent_dir.join(std::path::Path::new(&t).with_extension("wav"));
+            let ts = tp.to_string_lossy().to_string();
+            if !tp.exists() { sonic::generate_stretched_audio(sname, &ts, rate, Some(audio)); }
+            // sonic 内已 drop/reinit audio，这里重新引用
+            let _ = audio.load(&ts);
+            ts
+        }
+    }
+}
 
 // ─── 鼠标输入状态 ───
 
@@ -64,7 +102,7 @@ enum MainMenuTab { Play = 0, Settings = 1, Edit = 2, Browse = 3, Exit = 4 }
 enum PlayModeTab { Back = 0, Solo = 1, Empty2 = 2, Empty3 = 3, Empty4 = 4 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SettingsFrom { MainMenu, SongSelect }
+enum SettingsFrom { MainMenu, SongSelect, Editor }
 
 type AdjustFn = fn(&mut GameConfig, f64);
 
@@ -82,11 +120,13 @@ enum AppState {
     MainMenu { tab: MainMenuTab, cover_regions: Vec<skin::AtlasRegion>, cover_idx: usize, cycle_start: std::time::Instant, config: GameConfig },
     PlayMode { tab: PlayModeTab, cover_regions: Vec<skin::AtlasRegion>, cover_idx: usize, cycle_start: std::time::Instant, config: GameConfig },
     SongSelect { state: SongSelectState, config: GameConfig },
-    Settings { primary: usize, secondary: usize, binding_idx: Option<usize>, adjuster: Option<Adjuster>, cover_regions: Vec<skin::AtlasRegion>, cover_idx: usize, cycle_start: std::time::Instant, config: GameConfig, from: SettingsFrom },
+    Settings { primary: usize, secondary: usize, binding_idx: Option<usize>, adjuster: Option<Adjuster>, cover_regions: Vec<skin::AtlasRegion>, cover_idx: usize, cycle_start: std::time::Instant, config: GameConfig, from: SettingsFrom, spect_config: Option<editor::config::SpectrogramConfig> },
     Preview { song: SongEntry, diff: usize, name: String, dur: String, notes: usize, stars: f64, config: GameConfig },
     Gameplay { engine: GameEngine, replay_data: Option<crate::replay::ReplayData>, config: GameConfig },
     ReplayList { state: menu::replay_list::ReplayListState },
     ReplayPlayback { engine: crate::replay_viewer::ReplayEngine, replay: crate::replay::ReplayData, config: GameConfig, folder_idx: usize, diff_idx: usize },
+    Editor { state: editor::EditorState, config: GameConfig },
+    EditorFileBrowser { state: menu::editor_file_browser::EditorFileBrowser, config: GameConfig },
     Results {
         result: GameResult,
         replay: Option<crate::replay::ReplayData>,
@@ -104,8 +144,9 @@ enum AppState {
 
 fn main() {
     #[cfg(feature = "dhat-heap")]
-    let _profiler = dhat::Profiler::new_heap(); // 程序退出时自动写入 dhat-heap.json
+    let _profiler = dhat::Profiler::new_heap();
     env_logger::init();
+
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
     let config = GameConfig::load("config.json");
@@ -124,10 +165,11 @@ fn main() {
         }
     }
     let extra_chars = menu::collect_ui_chars(&songs);
-    event_loop.run_app(&mut App { state: AppState::Splash { cover_regions: vec![], cover_idx: 0, cycle_start: std::time::Instant::now() - std::time::Duration::from_secs(10) }, window, render: None, config, input: InputState::default(), extra_chars, pending_cover: None, cover_paths, folders_cache, shift_held: false, prev_folder_idx: 0, prev_diff_idx: 0 }).unwrap();
+    let gpu = pollster::block_on(render::context::GpuContext::new(&window));
+    event_loop.run_app(&mut App { state: AppState::Splash { cover_regions: vec![], cover_idx: 0, cycle_start: std::time::Instant::now() - std::time::Duration::from_secs(10) }, window, render: None, gpu, config, input: InputState::default(), extra_chars, pending_cover: None, cover_paths, folders_cache, shift_held: false, prev_folder_idx: 0, prev_diff_idx: 0 }).unwrap();
 }
 
-struct App { state: AppState, window: Arc<Window>, render: Option<RenderCtx>, config: GameConfig, input: InputState, extra_chars: Vec<char>, pending_cover: Option<String>, cover_paths: Vec<String>, folders_cache: Vec<FolderMeta>, shift_held: bool, prev_folder_idx: usize, prev_diff_idx: usize }
+struct App { state: AppState, window: Arc<Window>, render: Option<RenderCtx>, gpu: render::context::GpuContext, config: GameConfig, input: InputState, extra_chars: Vec<char>, pending_cover: Option<String>, cover_paths: Vec<String>, folders_cache: Vec<FolderMeta>, shift_held: bool, prev_folder_idx: usize, prev_diff_idx: usize }
 
 impl App {
     fn init_render(&mut self) {
@@ -137,7 +179,7 @@ impl App {
                     let rng = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as usize).unwrap_or(0);
                     let path = self.cover_paths.get(rng % self.cover_paths.len().max(1)).map(|p| std::path::Path::new(p.as_str()));
                     let cpu = CpuSkin::load_menu_bg(path);
-                    let render = pollster::block_on(RenderCtx::new(self.window.clone(), cpu, &self.extra_chars));
+                    let render = pollster::block_on(RenderCtx::new(self.window.clone(), cpu, &self.extra_chars, &self.gpu));
                     let region = render.skin_regions().get("bg_cover").cloned();
                     match &mut self.state {
                         AppState::Splash { ref mut cover_regions, .. }
@@ -153,8 +195,8 @@ impl App {
                 AppState::SongSelect { ref state, .. } => {
                     let cover = state.current_diff().cover_path.as_deref();
                     log::info!("[Cover] init_render cover={:?}", cover);
-                    let cpu = CpuSkin::load(&self.config.active_skin, cover.map(std::path::Path::new));
-                    let render = pollster::block_on(RenderCtx::new(self.window.clone(), cpu, &self.extra_chars));
+                    let cpu = CpuSkin::load_menu_bg(cover.map(std::path::Path::new));
+                    let render = pollster::block_on(RenderCtx::new(self.window.clone(), cpu, &self.extra_chars, &self.gpu));
                     if let AppState::SongSelect { ref mut state, .. } = self.state {
                         if state.cover_region.is_none() {
                             state.cover_region = render.skin_regions().get("bg_cover").cloned();
@@ -165,11 +207,17 @@ impl App {
                 AppState::Results { ref result, .. } => {
                     let cp = result.cover_path.as_deref();
                     let cpu = CpuSkin::load(&self.config.active_skin, cp.map(std::path::Path::new));
-                    self.render = Some(pollster::block_on(RenderCtx::new(self.window.clone(), cpu, &self.extra_chars)));
+                    self.render = Some(pollster::block_on(RenderCtx::new(self.window.clone(), cpu, &self.extra_chars, &self.gpu)));
+                }
+                AppState::Editor { ref state, .. } => {
+                    let cover = state.bg_path.as_deref().map(std::path::Path::new);
+                    log::info!("[Cover] init_render editor cover={:?}", cover);
+                    let cpu = CpuSkin::load(&self.config.active_skin, cover);
+                    self.render = Some(pollster::block_on(RenderCtx::new(self.window.clone(), cpu, &self.extra_chars, &self.gpu)));
                 }
                 _ => {
                     let cpu = CpuSkin::load(&self.config.active_skin, None);
-                    self.render = Some(pollster::block_on(RenderCtx::new(self.window.clone(), cpu, &self.extra_chars)));
+                    self.render = Some(pollster::block_on(RenderCtx::new(self.window.clone(), cpu, &self.extra_chars, &self.gpu)));
                 }
             }
             // 提取 Results 的曲绘区域
@@ -184,7 +232,7 @@ impl App {
     }
     fn update_cover(&mut self, cover_path: Option<&str>) {
         let cpu = CpuSkin::load(&self.config.active_skin, cover_path.map(|p| std::path::Path::new(p)));
-        self.render = Some(pollster::block_on(RenderCtx::new(self.window.clone(), cpu, &self.extra_chars)));
+        self.render = Some(pollster::block_on(RenderCtx::new(self.window.clone(), cpu, &self.extra_chars, &self.gpu)));
         // 提取新 atlas 中的 bg_cover 区域
         if let Some(ref r) = self.render {
             let region = r.skin_regions().get("bg_cover").cloned();
@@ -195,10 +243,11 @@ impl App {
     }
     fn submit(&mut self) {
         let r = self.render.as_mut().unwrap();
-        r.quad.upload(&r.queue); let gc = r.text.upload(&r.queue);
+        let gpu = r.gpu.clone();
+        r.quad.upload(&gpu.queue); let gc = r.text.upload(&gpu.queue);
         if let Ok(o) = r.begin_frame() {
             let v = o.texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let mut e = r.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            let mut e = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
             { let mut rp = e.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None, color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &v, resolve_target: None,
@@ -207,7 +256,7 @@ impl App {
             });
             r.quad.draw(&mut rp, r.quad.last_buffer(), r.quad.instances.len());
             r.text.draw(&mut rp, gc); }
-            r.queue.submit([e.finish()]); r.end_frame(o);
+            gpu.queue.submit([e.finish()]); r.end_frame(o);
         }
     }
 }
@@ -237,10 +286,16 @@ impl winit::application::ApplicationHandler for App {
                 else { self.input.mouse.left_released = true; }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                self.input.mouse.wheel = match delta {
+                let wheel_val = match delta {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => y * 30.0,
                     winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32,
                 };
+                self.input.mouse.wheel = wheel_val;
+                // 编辑器滚轮进度
+                if let AppState::Editor { ref mut state, .. } = &mut self.state {
+                    let shift = self.shift_held;
+                    editor::input::handle_editor_wheel(state, wheel_val, shift);
+                }
             }
             WindowEvent::RedrawRequested => self.on_redraw(),
             _ => {}
@@ -252,6 +307,10 @@ impl winit::application::ApplicationHandler for App {
 impl App {
     fn on_redraw(&mut self) {
         self.input.begin_frame();
+        // 异步频谱: 最先检查, 避免借用冲突 (不 return, 同帧 init_render 无缝)
+        if let AppState::Editor { ref mut state, .. } = &mut self.state {
+            if state.update() { self.render = None; }
+        }
         if let AppState::Gameplay { engine, .. } = &mut self.state { engine.render_frame(); return; }
         // ReplayPlayback: render + 3s auto-advance
         let mut replay_transition = false;
@@ -335,7 +394,7 @@ impl App {
                     let clicked_tab = if clicked_circle { Some(1) } else { hov };
                     if let Some(idx) = clicked_tab {
                         match idx {
-                            0 => { self.render = None; self.state = AppState::Settings { primary: 0, secondary: 0, binding_idx: None, adjuster: None, cover_regions: vec![], cover_idx: 0, cycle_start: std::time::Instant::now() - std::time::Duration::from_secs(10), config: config.clone(), from: SettingsFrom::MainMenu }; return; }
+                            0 => { self.render = None; self.state = AppState::Settings { primary: 0, secondary: 0, binding_idx: None, adjuster: None, cover_regions: vec![], cover_idx: 0, cycle_start: std::time::Instant::now() - std::time::Duration::from_secs(10), config: config.clone(), from: SettingsFrom::MainMenu, spect_config: None }; return; }
                             1 => { let empty = vec![]; self.render = None; self.state = AppState::PlayMode { tab: PlayModeTab::Solo, cover_regions: empty, cover_idx: 0, cycle_start: std::time::Instant::now() - std::time::Duration::from_secs(10), config: config.clone() }; return; }
                             4 => { self.state = AppState::ExitConfirm; return; }
                             _ => {}
@@ -365,6 +424,20 @@ impl App {
         self.init_render();
         let r = self.render.as_mut().unwrap();
 
+        // Editor 频谱管理: 初始化/上传 GPU 纹理
+        if let AppState::Editor { ref mut state, .. } = &mut self.state {
+            if state.spectrum_needs_init {
+                r.set_spectrum(state.spectrum_w.max(1), state.spectrum_h.max(1), &state.spect_config.colormap);
+                state.spectrum_needs_init = false;
+            }
+            if state.spectrum_needs_upload {
+                if let Some(ref matrix) = state.spectrogram_matrix {
+                    r.update_spectrum_rect(0, 0, state.spectrum_w.max(1), state.spectrum_h.max(1), matrix);
+                }
+                state.spectrum_needs_upload = false;
+            }
+        }
+
         // 提取 osu! logo 区域 (必须在 mut borrow 之前)
         let logo_region = r.skin_regions().get("osu_logo").cloned();
         // 结算页面曲绘：直接从 render context 获取（避免首帧延迟）
@@ -383,6 +456,11 @@ impl App {
 
         let logo = logo_region.as_ref();
 
+        // 编辑器播放时自动同步光标
+        if let AppState::Editor { ref mut state, .. } = &mut self.state {
+            if state.playing { state.cursor_ms = state.audio.position_ms(); }
+        }
+
         match &self.state {
             AppState::Splash { ref cover_regions, ref cover_idx, .. } => {
                 let region = cover_regions.get(*cover_idx);
@@ -399,12 +477,19 @@ impl App {
             AppState::SongSelect { state, config } => {
                 song_select::render(q, t, state, config);
             }
-            AppState::Settings { primary, secondary, binding_idx, adjuster, ref cover_regions, ref cover_idx, config, .. } => {
+            AppState::Settings { primary, secondary, binding_idx, adjuster, ref cover_regions, ref cover_idx, config, ref spect_config, .. } => {
                 let region = cover_regions.get(*cover_idx);
-                menu::settings::render_settings(q, t, region, *primary, *secondary, *binding_idx, adjuster.as_ref(), config);
+                menu::settings::render_settings(q, t, region, *primary, *secondary, *binding_idx, adjuster.as_ref(), config, spect_config.as_ref());
             }
             AppState::Preview { song, diff, name, dur, notes, stars, config } => menu::preview::render_preview(q, t, song, *diff, name, *stars, dur, *notes, config.song_rate, None),
             AppState::ReplayList { state } => menu::replay_list::render(state, q, t),
+            AppState::EditorFileBrowser { ref state, .. } => {
+                let region = logo_region.as_ref(); // use logo as cover
+                menu::editor_file_browser::render(state, q, t, region);
+            }
+            AppState::Editor { ref state, .. } => {
+                editor::render::render_editor(state, crate::game::notes::screen_w(), q, t);
+            }
             AppState::ExitConfirm => menu::exit::render(q, t),
             AppState::Results { result, offsets, page, chart_view_start, chart_view_end, chart_n_sec, chart_adjust_n, .. } => {
                 render_results(result, offsets, *page, *chart_view_start, *chart_view_end, *chart_n_sec, q, t, results_cover.as_ref());
@@ -431,27 +516,30 @@ impl App {
         // 延迟加载曲绘
         if let Some(ref cp) = self.pending_cover.take() {
             log::info!("[Cover] loading cover from: {}", cp);
-            let is_menu = matches!(self.state, AppState::Splash { .. } | AppState::MainMenu { .. } | AppState::PlayMode { .. } | AppState::Settings { .. });
-            let cpu = if is_menu {
-                CpuSkin::load_menu_bg(Some(std::path::Path::new(cp)))
+            let is_menu = matches!(self.state, AppState::Splash { .. } | AppState::MainMenu { .. } | AppState::PlayMode { .. } | AppState::Settings { .. } | AppState::SongSelect { .. });
+            if is_menu {
+                // 菜单状态：就地更新封面纹理，不重建 RenderCtx/atlas
+                if let Some(ref r) = self.render {
+                    r.update_cover(std::path::Path::new(cp));
+                }
+                let region = self.render.as_ref().and_then(|r| r.skin_regions().get("bg_cover").cloned());
+                match &mut self.state {
+                    AppState::Splash { ref mut cover_regions, .. }
+                    | AppState::MainMenu { ref mut cover_regions, .. }
+                    | AppState::PlayMode { ref mut cover_regions, .. }
+                    | AppState::Settings { ref mut cover_regions, .. } => {
+                        *cover_regions = region.into_iter().collect();
+                    }
+                    AppState::SongSelect { ref mut state, .. } => {
+                        state.cover_region = region;
+                    }
+                    _ => {}
+                }
             } else {
-                CpuSkin::load(&self.config.active_skin, Some(std::path::Path::new(cp)))
-            };
-            let render = pollster::block_on(RenderCtx::new(self.window.clone(), cpu, &self.extra_chars));
-            let region = render.skin_regions().get("bg_cover").cloned();
-            match &mut self.state {
-                AppState::Splash { ref mut cover_regions, .. }
-                | AppState::MainMenu { ref mut cover_regions, .. }
-                | AppState::PlayMode { ref mut cover_regions, .. }
-                | AppState::Settings { ref mut cover_regions, .. } => {
-                    *cover_regions = region.into_iter().collect();
-                }
-                AppState::SongSelect { ref mut state, .. } => {
-                    state.cover_region = region;
-                }
-                _ => {}
+                let cpu = CpuSkin::load(&self.config.active_skin, Some(std::path::Path::new(cp)));
+                let render = pollster::block_on(RenderCtx::new(self.window.clone(), cpu, &self.extra_chars, &self.gpu));
+                self.render = Some(render);
             }
-            self.render = Some(render);
         }
     }
 
@@ -462,10 +550,9 @@ impl App {
             // 同步引擎内的 replay_data 到 AppState
             if replay_data.is_none() { *replay_data = engine.replay_data.take(); }
             if exit {
-                self.render = None;
+                self.render = None; // 清旧 RenderCtx，init_render 会重建正确的 atlas
                 if replay_data.is_none() { *replay_data = engine.replay_data.take(); }
                 let rd = replay_data.take();
-                // 正常结束（有 GameResult）→ 结算；暂停退出 → 返回选歌
                 if let Some(result) = engine.take_result() {
                     let offsets = rd.as_ref().map(|r| crate::game::results::compute_hit_offsets(r, &result.map_path)).unwrap_or_default();
                     next = Some(AppState::Results {
@@ -481,6 +568,8 @@ impl App {
             }
             let to_results = matches!(next, Some(AppState::Results { .. }));
             if let Some(s) = next { self.state = s; }
+            // 强制 GPU 清理：释放旧 gameplay atlas (36MB) 等待回收纹理
+            self.gpu.inner().device.poll(wgpu::Maintain::Wait);
             if to_results { self.window.request_redraw(); }
             return;
         }
@@ -504,7 +593,12 @@ impl App {
                         self.render = None;
                         next = Some(AppState::PlayMode { tab: PlayModeTab::Solo, cover_regions: empty, cover_idx: 0, cycle_start: std::time::Instant::now() - std::time::Duration::from_secs(10), config: config.clone() });
                     }
-                    MainMenuTab::Settings => { self.render = None; next = Some(AppState::Settings { primary: 0, secondary: 0, binding_idx: None, adjuster: None, cover_regions: vec![], cover_idx: 0, cycle_start: std::time::Instant::now() - std::time::Duration::from_secs(10), config: config.clone(), from: SettingsFrom::MainMenu }); }
+                    MainMenuTab::Settings => { self.render = None; next = Some(AppState::Settings { primary: 0, secondary: 0, binding_idx: None, adjuster: None, cover_regions: vec![], cover_idx: 0, cycle_start: std::time::Instant::now() - std::time::Duration::from_secs(10), config: config.clone(), from: SettingsFrom::MainMenu, spect_config: None }); }
+                    MainMenuTab::Edit => {
+                        let fb = menu::editor_file_browser::scan();
+                        self.render = None;
+                        next = Some(AppState::EditorFileBrowser { state: fb, config: config.clone() });
+                    }
                     MainMenuTab::Exit => next = Some(AppState::ExitConfirm),
                     _ => {}
                 },
@@ -595,32 +689,34 @@ impl App {
                         let sname = meta.song.clone();
                         let rnotes: Vec<NoteRT> = bnotes.into_iter().map(|n| NoteRT { time: n.time, end_time: n.end_time, lane: n.lane, note_type: n.note_type, hit: false, missed: false, holding: false, ghost: false, stuck_y: None, release_time: None }).collect();
                         let mut audio = BassAudio::init().unwrap();
-                        let ap = if (config.song_rate - 1.0).abs() > 0.001 {
-                            let t = format!(".temp_{}x_{}", config.song_rate, Path::new(&sname).file_name().unwrap().to_string_lossy());
-                            let tp = Path::new(&json).parent().unwrap().join(Path::new(&t).with_extension("wav"));
-                            let ts = tp.to_string_lossy().to_string();
-                            if !tp.exists() { sonic::generate_stretched_audio(&sname, &ts, config.song_rate as f32, Some(&audio)); drop(audio); audio = BassAudio::init().unwrap(); }
-                            ts
-                        } else { sname.clone() };
-                        audio.load(&ap).expect("audio");
-                        let cover = meta.bg.as_ref().map(|bg| Path::new(&json).parent().unwrap().join(bg));
-                        let cpu = CpuSkin::load(&config.active_skin, cover.as_deref());
-                        let sc = cpu.config.clone();
-                        let render = pollster::block_on(RenderCtx::new(self.window.clone(), cpu, &self.extra_chars));
+                        let parent_dir = Path::new(&json).parent().unwrap();
+                        let _ = load_audio_with_rate(&mut audio, &sname, parent_dir, config.song_rate as f32);
+                        let cover = meta.bg.as_ref().map(|s| std::path::Path::new(s.as_str()));
+                        let cpu = CpuSkin::load(&config.active_skin, cover);
+                        let sc = cpu.config().clone();
+                        let render = pollster::block_on(RenderCtx::new(self.window.clone(), cpu, &self.extra_chars, &self.gpu));
                         let tdur = rnotes.iter().map(|n| n.end_time.max(n.time)).fold(1.0, f64::max);
                         let engine = GameEngine::new(audio, config.clone(), sname, json, rnotes, tdur, meta.offset, config.mirror_mode, cover.as_ref().map(|p| p.to_string_lossy().to_string()), Some(render.skin_regions()), Some(sc), self.window.clone(), render);
+                        // 保留 self.render (菜单 RenderCtx)，游玩结束后复用，避免重新创建 Instance+Device
                         next = Some(AppState::Gameplay { engine, replay_data: None, config: config.clone() });
                     }
                 }
-                KeyCode::KeyS => { self.render = None; next = Some(AppState::Settings { primary: 0, secondary: 0, binding_idx: None, adjuster: None, cover_regions: vec![], cover_idx: 0, cycle_start: std::time::Instant::now() - std::time::Duration::from_secs(10), config: config.clone(), from: SettingsFrom::SongSelect }); }
+                KeyCode::KeyS => { self.render = None; next = Some(AppState::Settings { primary: 0, secondary: 0, binding_idx: None, adjuster: None, cover_regions: vec![], cover_idx: 0, cycle_start: std::time::Instant::now() - std::time::Duration::from_secs(10), config: config.clone(), from: SettingsFrom::SongSelect, spect_config: None }); }
                 KeyCode::Escape => { let empty = vec![]; self.render = None; next = Some(AppState::MainMenu { tab: MainMenuTab::Play, cover_regions: empty, cover_idx: 0, cycle_start: std::time::Instant::now() - std::time::Duration::from_secs(10), config: config.clone() }); }
                 KeyCode::Comma => { config.scroll_speed = (config.scroll_speed - 0.5).max(5.0); }
                 KeyCode::Period => { config.scroll_speed += 0.5; }
                 KeyCode::KeyA => config.global_offset -= 5.0,
                 KeyCode::KeyD => config.global_offset += 5.0,
-                KeyCode::KeyW => config.song_rate = (config.song_rate - 0.1).max(0.5),
-                KeyCode::KeyE => config.song_rate = (config.song_rate + 0.1).min(2.0),
+                KeyCode::KeyW => { config.song_rate = (config.song_rate - 0.1).max(0.5); refresh_diffs_for_rate(state, config); }
+                KeyCode::KeyE => { config.song_rate = (config.song_rate + 0.1).min(2.0); refresh_diffs_for_rate(state, config); }
                 KeyCode::KeyF => config.fullscreen = !config.fullscreen,
+                KeyCode::KeyI => {
+                    let json = state.current_folder().jsons[state.diff_idx].clone();
+                    if let Ok(es) = crate::editor::EditorState::from_existing(&json, config.clone()) {
+                        self.render = None;
+                        next = Some(AppState::Editor { state: es, config: config.clone() });
+                    }
+                }
                 KeyCode::KeyR => {
                     let map_path = state.current_folder().jsons[state.diff_idx].clone();
                     let entries: Vec<_> = crate::replay::list_replays(&map_path).into_iter()
@@ -651,18 +747,12 @@ impl App {
                     if let Ok((meta, _bnotes)) = load_beatmap_rox(&rdata.map_path) {
                         let sname = meta.song.clone();
                         let mut audio = BassAudio::init().unwrap();
-                        let ap = if (rdata.song_rate - 1.0).abs() > 0.001 {
-                            let t = format!(".temp_{}x_{}", rdata.song_rate, Path::new(&sname).file_name().unwrap().to_string_lossy());
-                            let tp = Path::new(&rdata.map_path).parent().unwrap().join(Path::new(&t).with_extension("wav"));
-                            let ts = tp.to_string_lossy().to_string();
-                            if !tp.exists() { sonic::generate_stretched_audio(&sname, &ts, rdata.song_rate as f32, Some(&audio)); drop(audio); audio = BassAudio::init().unwrap(); }
-                            ts
-                        } else { sname.clone() };
-                        let _ = audio.load(&ap);
-                        let cover = meta.bg.as_ref().map(|bg| Path::new(&rdata.map_path).parent().unwrap().join(bg));
+                        let parent_dir = Path::new(&rdata.map_path).parent().unwrap();
+                        let ap = load_audio_with_rate(&mut audio, &sname, parent_dir, rdata.song_rate as f32);
+                        let cover = meta.bg.as_ref().as_ref().map(|s| std::path::Path::new(s.as_str()));
                         let cpu = CpuSkin::load(&config.active_skin, cover.as_deref());
-                        let sc = cpu.config.clone();
-                        let render = pollster::block_on(RenderCtx::new(self.window.clone(), cpu, &self.extra_chars));
+                        let sc = cpu.config().clone();
+                        let render = pollster::block_on(RenderCtx::new(self.window.clone(), cpu, &self.extra_chars, &self.gpu));
                         drop(audio); // 释放 BASS 让 ReplayEngine 自己初始化
                         match crate::replay_viewer::ReplayEngine::new(
                             rdata.clone(), &ap, &rdata.map_path,
@@ -670,7 +760,6 @@ impl App {
                             self.window.clone(), render,
                         ) {
                             Ok(engine) => {
-                                self.render = None;
                                 next = Some(AppState::ReplayPlayback { engine, replay: rdata.clone(), config, folder_idx: state.folder_idx, diff_idx: state.diff_idx });
                             }
                             Err(e) => log::error!("ReplayEngine: {e}"),
@@ -734,7 +823,45 @@ impl App {
                     }
                 }
             }
-            AppState::Settings { primary, secondary, binding_idx, adjuster, config, from, .. } => {
+            AppState::EditorFileBrowser { state, config, .. } => {
+                if let Some(path) = menu::editor_file_browser::handle_key(state, key) {
+                    if path.is_empty() {
+                        self.render = None;
+                        next = Some(AppState::MainMenu { tab: MainMenuTab::Play, cover_regions: vec![], cover_idx: 0, cycle_start: std::time::Instant::now() - std::time::Duration::from_secs(10), config: config.clone() });
+                    } else {
+                        if let Ok(mut es) = crate::editor::EditorState::new_blank(config.clone()) {
+                            let _ = es.load_audio(&path);
+                            self.render = None;
+                            next = Some(AppState::Editor { state: es, config: config.clone() });
+                        }
+                    }
+                }
+            }
+            AppState::Editor { state, config, .. } => {
+                let action = editor::input::handle_editor_key(state, key, self.shift_held, false);
+                if let Some(act) = action {
+                    match act {
+                        editor::input::EditorAction::Exit => {
+                            state.cleanup();
+                            self.render = None;
+                            next = Some(AppState::MainMenu { tab: MainMenuTab::Play, cover_regions: vec![], cover_idx: 0, cycle_start: std::time::Instant::now() - std::time::Duration::from_secs(10), config: config.clone() });
+                        }
+                        editor::input::EditorAction::ExitDirty => {
+                            state.cleanup();
+                            self.render = None;
+                            next = Some(AppState::MainMenu { tab: MainMenuTab::Play, cover_regions: vec![], cover_idx: 0, cycle_start: std::time::Instant::now() - std::time::Duration::from_secs(10), config: config.clone() });
+                        }
+                        editor::input::EditorAction::OpenSettings => {
+                            self.render = None;
+                            next = Some(AppState::Settings { primary: 5, secondary: 0, binding_idx: None, adjuster: None, cover_regions: vec![], cover_idx: 0, cycle_start: std::time::Instant::now() - std::time::Duration::from_secs(10), config: config.clone(), from: SettingsFrom::Editor, spect_config: Some(state.spect_config.clone()) });
+                        }
+                        editor::input::EditorAction::RefreshTexture => {
+                            self.render = None;
+                        }
+                    }
+                }
+            }
+            AppState::Settings { primary, secondary, binding_idx, adjuster, config, from, ref mut spect_config, .. } => {
                 // 调节器模式
                 if let Some(ref mut adj) = adjuster {
                     match key {
@@ -756,12 +883,20 @@ impl App {
                 }
                 // 正常导航
                 match key {
-                    KeyCode::Escape => { config.save("config.json"); let empty = vec![]; self.render = None; next = Some(match *from { SettingsFrom::SongSelect => { let state = SongSelectState::new(self.folders_cache.clone(), config.clone()); AppState::SongSelect { state, config: config.clone() } } SettingsFrom::MainMenu => AppState::MainMenu { tab: MainMenuTab::Play, cover_regions: empty, cover_idx: 0, cycle_start: std::time::Instant::now() - std::time::Duration::from_secs(10), config: config.clone() } }); }
-                    KeyCode::ArrowLeft => *primary = (*primary + 4) % 5,
-                    KeyCode::ArrowRight => *primary = (*primary + 1) % 5,
+                    KeyCode::Escape => { config.save("config.json"); let empty = vec![]; self.render = None; next = Some(match *from { SettingsFrom::SongSelect => { let state = SongSelectState::new(self.folders_cache.clone(), config.clone()); AppState::SongSelect { state, config: config.clone() } }, SettingsFrom::MainMenu => AppState::MainMenu { tab: MainMenuTab::Play, cover_regions: empty, cover_idx: 0, cycle_start: std::time::Instant::now() - std::time::Duration::from_secs(10), config: config.clone() }, SettingsFrom::Editor => AppState::MainMenu { tab: MainMenuTab::Play, cover_regions: empty, cover_idx: 0, cycle_start: std::time::Instant::now() - std::time::Duration::from_secs(10), config: config.clone() } }); }
+                    KeyCode::ArrowLeft => *primary = (*primary + 5) % 6,
+                    KeyCode::ArrowRight => *primary = (*primary + 1) % 6,
                     KeyCode::ArrowUp => if *secondary > 0 { *secondary -= 1; },
                     KeyCode::ArrowDown => { let max = settings_secondary_count(*primary); if *secondary + 1 < max { *secondary += 1; } }
-                    KeyCode::Enter => settings_activate(primary, secondary, binding_idx, adjuster, config),
+                    KeyCode::Enter => {
+                        // 制谱器 → 切换频谱显示
+                        if *primary == 5 && *secondary == 0 {
+                            if let Some(ref mut sc) = spect_config {
+                                sc.show_spectrogram = !sc.show_spectrogram;
+                                let _ = sc.save();
+                            }
+                        } else { settings_activate(primary, secondary, binding_idx, adjuster, config); }
+                    }
                     // 快捷键始终有效
                     KeyCode::Digit1 => *binding_idx = Some(0),
                     KeyCode::Digit2 => *binding_idx = Some(1),
@@ -777,14 +912,15 @@ impl App {
                         let sname = meta.song.clone();
                         let rnotes: Vec<NoteRT> = bnotes.into_iter().map(|n| NoteRT { time: n.time, end_time: n.end_time, lane: n.lane, note_type: n.note_type, hit: false, missed: false, holding: false, ghost: false, stuck_y: None, release_time: None }).collect();
                         let mut audio = BassAudio::init().unwrap();
-                        let ap = if (config.song_rate - 1.0).abs() > 0.001 { let t = format!(".temp_{}x_{}", config.song_rate, Path::new(&sname).file_name().unwrap().to_string_lossy()); let tp = Path::new(&path).parent().unwrap().join(Path::new(&t).with_extension("wav")); let ts = tp.to_string_lossy().to_string(); if !tp.exists() { sonic::generate_stretched_audio(&sname, &ts, config.song_rate as f32, Some(&audio)); drop(audio); audio = BassAudio::init().unwrap(); } ts } else { sname.clone() };
-                        audio.load(&ap).expect("audio");
-                        let cover = meta.bg.as_ref().map(|bg| Path::new(&path).parent().unwrap().join(bg));
+                        let parent_dir = Path::new(&path).parent().unwrap();
+                        let _ = load_audio_with_rate(&mut audio, &sname, parent_dir, config.song_rate as f32);
+                        let cover = meta.bg.as_ref().as_ref().map(|s| std::path::Path::new(s.as_str()));
                         let cpu = CpuSkin::load(&config.active_skin, cover.as_deref());
-                        let sc = cpu.config.clone();
-                        let render = pollster::block_on(RenderCtx::new(self.window.clone(), cpu, &self.extra_chars));
+                        let sc = cpu.config().clone();
+                        let render = pollster::block_on(RenderCtx::new(self.window.clone(), cpu, &self.extra_chars, &self.gpu));
                         let tdur = rnotes.iter().map(|n| n.end_time.max(n.time)).fold(1.0, f64::max);
                         let engine = GameEngine::new(audio, config.clone(), sname, path, rnotes, tdur, meta.offset, config.mirror_mode, cover.as_ref().map(|p| p.to_string_lossy().to_string()), Some(render.skin_regions()), Some(sc), self.window.clone(), render);
+                        // 保留 self.render (菜单 RenderCtx)，游玩结束后复用
                         next = Some(AppState::Gameplay { engine, replay_data: None, config: config.clone() });
                     }
                 }
@@ -849,12 +985,12 @@ impl App {
                                 let sname = meta.song.clone();
                                 let rnotes: Vec<NoteRT> = bnotes.into_iter().map(|n| NoteRT { time: n.time, end_time: n.end_time, lane: n.lane, note_type: n.note_type, hit: false, missed: false, holding: false, ghost: false, stuck_y: None, release_time: None }).collect();
                                 let mut audio = BassAudio::init().unwrap();
-                                let ap = if (config.song_rate - 1.0).abs() > 0.001 { let t = format!(".temp_{}x_{}", config.song_rate, Path::new(&sname).file_name().unwrap().to_string_lossy()); let tp = Path::new(&result.map_path).parent().unwrap().join(Path::new(&t).with_extension("wav")); let ts = tp.to_string_lossy().to_string(); if !tp.exists() { sonic::generate_stretched_audio(&sname, &ts, config.song_rate as f32, Some(&audio)); drop(audio); audio = BassAudio::init().unwrap(); } ts } else { sname.clone() };
-                                audio.load(&ap).expect("audio");
-                                let cover = meta.bg.as_ref().map(|bg| Path::new(&result.map_path).parent().unwrap().join(bg));
+                                let parent_dir = Path::new(&result.map_path).parent().unwrap();
+                                let _ = load_audio_with_rate(&mut audio, &sname, parent_dir, config.song_rate as f32);
+                                let cover = meta.bg.as_ref().as_ref().map(|s| std::path::Path::new(s.as_str()));
                                 let cpu = CpuSkin::load(&config.active_skin, cover.as_deref());
-                                let sc = cpu.config.clone();
-                                let render = pollster::block_on(RenderCtx::new(self.window.clone(), cpu, &self.extra_chars));
+                                let sc = cpu.config().clone();
+                                let render = pollster::block_on(RenderCtx::new(self.window.clone(), cpu, &self.extra_chars, &self.gpu));
                                 let tdur = rnotes.iter().map(|n| n.end_time.max(n.time)).fold(1.0, f64::max);
                                 let engine = GameEngine::new(audio, config.clone(), sname, result.map_path.clone(), rnotes, tdur, meta.offset, config.mirror_mode, cover.as_ref().map(|p| p.to_string_lossy().to_string()), Some(render.skin_regions()), Some(sc), self.window.clone(), render);
                                 self.render = None;

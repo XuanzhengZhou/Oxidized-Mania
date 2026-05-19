@@ -11,7 +11,9 @@ const PRIMARY_SEL:  [u8; 4] = [45, 42, 59, 160];
 const SECONDARY_BG: [u8; 4] = [48, 46, 55, 140];
 const LEFT_BG:      [u8; 4] = [24, 22, 30, 140];
 
-const PRIMARY_LABELS: &[&str] = &["游玩设置", "音频设置", "键位设置", "显示设置", "皮肤设置"];
+const PRIMARY_LABELS: &[&str] = &["游玩设置", "音频设置", "键位设置", "显示设置", "皮肤设置", "制谱器"];
+
+use crate::editor::config::SpectrogramConfig;
 
 pub fn render_settings(
     quad: &mut QuadRenderer,
@@ -22,6 +24,7 @@ pub fn render_settings(
     binding_idx: Option<usize>,
     adjuster: Option<&crate::Adjuster>,
     config: &GameConfig,
+    spect_config: Option<&SpectrogramConfig>,
 ) {
     let w = screen_w();
     draw_menu_background(quad, cover_region);
@@ -40,7 +43,7 @@ pub fn render_settings(
 
     // 中栏背景 + 二级菜单
     quad.push_rect(mid_x, 0.0, mid_w, SCREEN_H, SECONDARY_BG);
-    let items = secondary_items(primary, config);
+    let items = secondary_items(primary, config, spect_config);
     for (i, (label, val)) in items.iter().enumerate() {
         let y = 30.0 + i as f32 * 40.0;
         let color = if i == secondary { WHITE } else { GRAY_160 };
@@ -85,7 +88,7 @@ pub fn render_settings(
     }
 }
 
-pub fn secondary_items(primary: usize, config: &GameConfig) -> Vec<(&'static str, String)> {
+pub fn secondary_items(primary: usize, config: &GameConfig, spect_config: Option<&SpectrogramConfig>) -> Vec<(&'static str, String)> {
     match primary {
         0 => vec![
             ("流速", format!("{:.2}", config.scroll_speed)),
@@ -113,10 +116,20 @@ pub fn secondary_items(primary: usize, config: &GameConfig) -> Vec<(&'static str
             ("当前皮肤", if config.active_skin.is_empty() { "默认".into() } else { config.active_skin.clone() }),
             ("切换皮肤", "按 T / Y".into()),
         ],
+        5 => spect_config.map(|sc| vec![
+            ("显示频谱", if sc.show_spectrogram { "开".into() } else { "关".into() }),
+            ("频谱配色", sc.colormap.clone()),
+            ("Mel 频带数", format!("{}", sc.n_mels)),
+            ("FFT 大小", format!("{}", sc.n_fft)),
+            ("Hop 步长", format!("{}", sc.hop_length)),
+            ("频率上限", format!("{:.0}Hz", sc.freq_max)),
+            ("频率下限", format!("{:.0}Hz", sc.freq_min)),
+            ("降噪门限", format!("{:.2}", sc.noise_gate)),
+        ]).unwrap_or_default(),
         _ => vec![],
     }
 }
 
 pub fn secondary_count(primary: usize) -> usize {
-    match primary { 0 => 6, 1 => 2, 2 => 4, 3 => 2, 4 => 2, _ => 0 }
+    match primary { 0 => 6, 1 => 2, 2 => 4, 3 => 2, 4 => 2, 5 => 8, _ => 0 }
 }

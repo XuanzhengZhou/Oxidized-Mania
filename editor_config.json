@@ -1,0 +1,9 @@
+{
+  "freq_min": 20.0,
+  "freq_max": 8000.0,
+  "n_mels": 512,
+  "n_fft": 4096,
+  "hop_length": 128,
+  "colormap": "magma",
+  "noise_gate": 0.35
+}

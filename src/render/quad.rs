@@ -44,6 +44,9 @@ struct VertexOutput {
 @group(0) @binding(0) var t_atlas: texture_2d<f32>;
 @group(0) @binding(1) var s_atlas: sampler;
 @group(0) @binding(2) var<uniform> screen: vec2<f32>;
+@group(0) @binding(3) var t_spectrum: texture_2d<f32>;
+@group(0) @binding(4) var s_spectrum: sampler;
+@group(0) @binding(5) var t_colormap: texture_1d<f32>;
 
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
@@ -61,6 +64,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let tex_color = textureSample(t_atlas, s_atlas, in.uv);
         return vec4<f32>(in.color.rgb, in.color.a * tex_color.a) * tex_color;
     }
+    if in.tex_index == 2u {
+        let value = textureSample(t_spectrum, s_spectrum, in.uv).r;
+        let final_color = textureSample(t_colormap, s_spectrum, value);
+        return vec4<f32>(in.color.rgb, in.color.a * final_color.a) * final_color;
+    }
     return in.color;
 }
 "#;
@@ -71,11 +79,19 @@ pub struct QuadRenderer {
     vertex_buffer: wgpu::Buffer,
     pub instance_buffers: Vec<wgpu::Buffer>,
     pub current_buffer: usize,
-    screen_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     pipeline: wgpu::RenderPipeline,
     pub instances: Vec<QuadInstance>,
     max_instances: usize,
+    // 频谱图纹理 (R8Unorm) + colormap (RGBA8 1D), 无频谱时用 1×1 dummy
+    spectrum_texture: wgpu::Texture,
+    spectrum_view: wgpu::TextureView,
+    spectrum_sampler: wgpu::Sampler,
+    colormap_texture: wgpu::Texture,
+    colormap_view: wgpu::TextureView,
+    // 缓存: 用于重建 bind_group (频谱纹理变化时)
+    bgl: wgpu::BindGroupLayout,
+    screen_buffer: wgpu::Buffer,
 }
 
 impl QuadRenderer {
@@ -127,6 +143,60 @@ impl QuadRenderer {
         });
         queue.write_buffer(&screen_buffer, 0, bytemuck::cast_slice(&[800.0f32, 600.0f32]));
 
+        // 频谱图 dummy 纹理 (1×1 R8Unorm) + 采样器 (无频谱时用)
+        let dummy_spectrum = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("dummy_spectrum"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &dummy_spectrum, mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[0u8],
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(1), rows_per_image: Some(1) },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        let dummy_spectrum_view = dummy_spectrum.create_view(&wgpu::TextureViewDescriptor::default());
+        let spectrum_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("spectrum_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        // 频谱 colormap dummy (256×1 RGBA8UnormSrgb 1D)
+        let dummy_colormap = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("dummy_colormap"),
+            size: wgpu::Extent3d { width: 256, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D1,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let dummy_colormap_pixels = crate::editor::analysis::build_colormap_pixels("magma");
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &dummy_colormap, mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &dummy_colormap_pixels,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(1024), rows_per_image: Some(1) },
+            wgpu::Extent3d { width: 256, height: 1, depth_or_array_layers: 1 },
+        );
+        let dummy_colormap_view = dummy_colormap.create_view(&wgpu::TextureViewDescriptor::default());
+
         let bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("quad_bgl"),
@@ -148,6 +218,25 @@ impl QuadRenderer {
                         ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: Some(std::num::NonZeroU64::new(8).unwrap()) },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3, visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2, multisampled: false,
+                        }, count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4, visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5, visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D1, multisampled: false,
+                        }, count: None,
+                    },
                 ],
             });
 
@@ -157,6 +246,9 @@ impl QuadRenderer {
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(atlas_view) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(atlas_sampler) },
                 wgpu::BindGroupEntry { binding: 2, resource: screen_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&dummy_spectrum_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&spectrum_sampler) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&dummy_colormap_view) },
             ],
         });
 
@@ -225,9 +317,15 @@ impl QuadRenderer {
         Self {
             vertex_buffer,
             instance_buffers, current_buffer: 0,
-            screen_buffer,
             bind_group, pipeline,
             instances: Vec::with_capacity(256), max_instances,
+            spectrum_texture: dummy_spectrum,
+            spectrum_view: dummy_spectrum_view,
+            spectrum_sampler,
+            colormap_texture: dummy_colormap,
+            colormap_view: dummy_colormap_view,
+            bgl: bind_group_layout,
+            screen_buffer,
         }
     }
 
@@ -274,6 +372,84 @@ impl QuadRenderer {
     }
 
     pub fn clear(&mut self) { self.instances.clear(); }
+
+    /// 创建/替换频谱纹理 + colormap; 用 atlas 重建 bind_group
+    pub fn set_spectrum(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, colormap: &str, atlas: &TextureAtlas) {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("spectrogram"),
+            size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        self.spectrum_texture = tex;
+        self.spectrum_view = view;
+
+        let pixels = crate::editor::analysis::build_colormap_pixels(colormap);
+        let cmap_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("colormap"),
+            size: wgpu::Extent3d { width: 256, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D1,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &cmap_tex, mip_level: 0,
+                origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &pixels,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(1024), rows_per_image: Some(1) },
+            wgpu::Extent3d { width: 256, height: 1, depth_or_array_layers: 1 },
+        );
+        let cmap_view = cmap_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        self.colormap_texture = cmap_tex;
+        self.colormap_view = cmap_view;
+
+        // 重建 bind_group (纹理引用变了)
+        self.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("quad_bg"), layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&atlas.view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&atlas.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: self.screen_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.spectrum_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.spectrum_sampler) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.colormap_view) },
+            ],
+        });
+    }
+
+    /// 增量上传频谱矩形区域 (chunk)
+    pub fn update_spectrum_rect(&self, queue: &wgpu::Queue, x: u32, y: u32, w: u32, h: u32, data: &[u8]) {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.spectrum_texture, mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+    }
+
+    /// 仅更新 colormap (用户切换时, 不重算矩阵)
+    pub fn update_colormap(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, name: &str, atlas: &TextureAtlas) {
+        let pixels = crate::editor::analysis::build_colormap_pixels(name);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &self.colormap_texture, mip_level: 0,
+                origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &pixels,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(1024), rows_per_image: Some(1) },
+            wgpu::Extent3d { width: 256, height: 1, depth_or_array_layers: 1 },
+        );
+        // 不需要重建 bind_group, texture 没变, 只是内容更新
+        let _ = (device, atlas); // future-proof
+    }
 
     pub fn draw<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, buf_idx: usize, count: usize) {
         if count == 0 { return; }

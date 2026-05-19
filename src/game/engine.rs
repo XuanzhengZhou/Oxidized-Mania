@@ -140,7 +140,7 @@ pub struct GameEngine {
     last_judgment: Option<(JudgmentResult, Instant)>,
     judgment_type: Option<JudgmentResult>,
     burst_start: Option<std::time::Instant>,
-    fps_times: Vec<Instant>,
+    fps_times: std::collections::VecDeque<std::time::Instant>,
     lanes: [f32; 4],
     screen_w: f32,
     hit_y: f64,
@@ -199,7 +199,7 @@ impl GameEngine {
             combo: 0, max_combo: 0,
             keys_pressed: [false; 4], last_judgment: None,
             judgment_type: None, burst_start: None,
-            fps_times: Vec::new(),
+            fps_times: std::collections::VecDeque::new(),
             lanes, screen_w, hit_y, note_w,
             skin_regions: skin_regions.clone(),
             skin_config,
@@ -226,10 +226,11 @@ impl GameEngine {
     }
 
     fn calc_fps(&mut self) -> f64 {
-        let now = Instant::now();
-        self.fps_times.push(now);
-        self.fps_times
-            .retain(|t| now.duration_since(*t).as_secs_f64() < 1.0);
+        let now = std::time::Instant::now();
+        self.fps_times.push_back(now);
+        while self.fps_times.front().map_or(false, |&t| now.duration_since(t).as_secs_f64() >= 1.0) {
+            self.fps_times.pop_front();
+        }
         self.fps_times.len() as f64
     }
 
@@ -569,11 +570,12 @@ impl GameEngine {
         // collect draws already happened inside the match
         self.profiler.end_section(1); // collect
 
-        let quad_count = self.render.quad.upload(&self.render.queue);
+        let gpu = self.render.gpu.clone();
+        let quad_count = self.render.quad.upload(&gpu.queue);
         let quad_buf_idx = self.render.quad.last_buffer();
         self.profiler.end_section(2); // quad upload
 
-        let glyph_count = self.render.text.upload(&self.render.queue);
+        let glyph_count = self.render.text.upload(&gpu.queue);
         self.profiler.end_section(3); // text upload
 
         self.profiler.quad_count = quad_count;
@@ -596,8 +598,7 @@ impl GameEngine {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut encoder = self
-            .render
+        let mut encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
@@ -618,7 +619,7 @@ impl GameEngine {
             self.render.quad.draw(&mut rpass, quad_buf_idx, quad_count);
             self.render.text.draw(&mut rpass, glyph_count);
         }
-        self.render.queue.submit([encoder.finish()]);
+        gpu.queue.submit([encoder.finish()]);
         self.profiler.end_section(5); // submit
 
         self.render.end_frame(output);
@@ -763,11 +764,12 @@ impl GameEngine {
     }
 
     fn do_gpu_submit(&mut self) {
-        self.render.quad.upload(&self.render.queue);
-        let gc = self.render.text.upload(&self.render.queue);
+        let gpu = self.render.gpu.clone();
+        self.render.quad.upload(&gpu.queue);
+        let gc = self.render.text.upload(&gpu.queue);
         if let Ok(o) = self.render.begin_frame() {
             let v = o.texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let mut e = self.render.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            let mut e = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
             { let mut rp = e.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None, color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &v, resolve_target: None,
@@ -778,7 +780,7 @@ impl GameEngine {
             rp.set_viewport(0.0, 0.0, self.render.config.width as f32, self.render.config.height as f32, 0.0, 1.0);
             self.render.quad.draw(&mut rp, self.render.quad.last_buffer(), qc);
             self.render.text.draw(&mut rp, gc); }
-            self.render.queue.submit([e.finish()]); self.render.end_frame(o);
+            gpu.queue.submit([e.finish()]); self.render.end_frame(o);
         }
     }
 

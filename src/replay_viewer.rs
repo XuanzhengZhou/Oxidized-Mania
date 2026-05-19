@@ -549,9 +549,10 @@ impl ReplayEngine {
     }
 
     fn submit(&mut self) {
-        let quad_count = self.render.quad.upload(&self.render.queue);
+        let gpu = self.render.gpu.clone();
+        let quad_count = self.render.quad.upload(&gpu.queue);
         let quad_buf_idx = self.render.quad.last_buffer();
-        let glyph_count = self.render.text.upload(&self.render.queue);
+        let glyph_count = self.render.text.upload(&gpu.queue);
 
         let output = match self.render.begin_frame() {
             Ok(o) => o,
@@ -563,7 +564,7 @@ impl ReplayEngine {
         };
 
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self.render.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("replay"),
@@ -576,7 +577,7 @@ impl ReplayEngine {
             self.render.quad.draw(&mut rpass, quad_buf_idx, quad_count);
             self.render.text.draw(&mut rpass, glyph_count);
         }
-        self.render.queue.submit([encoder.finish()]);
+        gpu.queue.submit([encoder.finish()]);
         self.render.end_frame(output);
     }
 }

@@ -18,6 +18,11 @@ flate2 = "1"
 rosu-pp = "4"
 rhythm-open-exchange = { git = "https://github.com/XuanzhengZhou/Rhythm-Open-Exchange.git", branch = "feat/malody-codec", features = ["analysis", "compression"] }
 dhat = "0.3"
+rustfft = "6"
+stratum-dsp = "1.0"
+spectrs = { version = "0.2", features = ["image"] }
+rayon = "1"
+zstd = "0.13"
 
 [features]
 dhat-heap = []

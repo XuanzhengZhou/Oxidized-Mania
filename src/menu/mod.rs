@@ -6,6 +6,7 @@ pub mod settings;
 pub mod replay_list;
 pub mod song_select;
 pub mod splash;
+pub mod editor_file_browser;
 
 #[derive(Clone)]
 pub struct SongEntry {

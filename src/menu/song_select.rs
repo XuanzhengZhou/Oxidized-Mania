@@ -79,12 +79,8 @@ pub fn build_folder_meta(songs: &[crate::menu::SongEntry], config: &GameConfig) 
         let author = s.dir_name.split(" - ").next().unwrap_or(&s.dir_name).to_string();
         let mut diffs = Vec::new();
         for j in &s.jsons {
-            let mut cover_path: Option<String> = None;
             if let Ok((meta, notes)) = crate::beatmap::load_beatmap_rox(j) {
-                if let Some(ref bg) = meta.bg {
-                    let json_dir = std::path::Path::new(j).parent().unwrap_or(std::path::Path::new("."));
-                    cover_path = Some(json_dir.join(bg).to_string_lossy().to_string());
-                }
+                let cover_path = meta.bg.clone(); // load_beatmap_rox 已解析为全路径
                 let raw_name = std::path::Path::new(j)
                     .file_stem().map(|st| st.to_string_lossy().to_string())
                     .unwrap_or_default();
